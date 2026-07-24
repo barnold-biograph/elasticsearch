@@ -20,320 +20,443 @@ import org.elasticsearch.compute.data.IntVector;
 import org.elasticsearch.compute.data.OrdinalBytesRefBlock;
 import org.elasticsearch.compute.data.OrdinalBytesRefVector;
 import org.elasticsearch.compute.data.Page;
+import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 
 /**
- * Base for operators that track the distinct values of a single key column across pages.
- * The behaviour is picked along two independent axes:
- * <ul>
- *   <li><b>key type</b> ({@code elementType}) selects the implementation (pimpl): a
- *       {@link BytesRefDistinctByOperator} for arbitrary keys (e.g. {@code _tsid}, backed by a
- *       hash table), or an {@link OrdinalDistinctByOperator} for a dense integer key (e.g. a join
- *       ordinal, backed by a {@link BitArray}).</li>
- *   <li><b>action</b> ({@code ignoreDuplicate}) selects what happens on a repeated key:
- *       {@code true} drops the row (deduplication), {@code false} throws (uniqueness enforcement).</li>
- * </ul>
- * Nulls are never treated as duplicates.
+ * Operator that tracks the distinct values of a single key column across pages.
+ * It either filters repeated keys or acts as a pass-through uniqueness guard.
+ * Null key positions are never treated as duplicates.
  */
-public abstract class DistinctByOperator extends AbstractPageMappingOperator {
+public final class DistinctByOperator extends AbstractPageMappingOperator {
 
-    /**
-     * Builds specialized {@link DistinctByOperator} for a key {@code keyChannel} of type INT.
-     */
-    public record IntFactory(int keyChannel, boolean ignoreDuplicate) implements OperatorFactory {
+    /** Builds a {@link DistinctByOperator} for a {@code BYTES_REF} key. */
+    public record BytesRefFactory(int keyChannel, boolean failOnDuplicate) implements OperatorFactory {
+
+        public BytesRefFactory(int keyChannel) {
+            this(keyChannel, false);
+        }
 
         @Override
         public Operator get(DriverContext driverContext) {
-            return new OrdinalDistinctByOperator(keyChannel, ignoreDuplicate, driverContext.bigArrays());
+            return new DistinctByOperator(
+                keyChannel(),
+                new BytesRefProcessor(keyChannel(), OnDuplicateKeyPolicy.newPolicy(failOnDuplicate), driverContext.blockFactory())
+            );
         }
 
         @Override
         public String describe() {
-            return "DistinctByOperator[keyChannel=" + keyChannel + "]";
+            return "DistinctByOperator[keyChannel=" + keyChannel + ", type=BYTES_REF]";
         }
     }
 
-    /**
-     * Builds generic {@link DistinctByOperator} for a key {@code keyChannel} of any type.
-     */
-    public record Factory(int keyChannel, boolean ignoreDuplicate) implements OperatorFactory {
+    /** Make {@link DistinctByOperator} for compact, non-negative, integer ordinal type. */
+    public record OrdinalFactory(int keyChannel, boolean failOnDuplicate) implements OperatorFactory {
+
+        public OrdinalFactory(int keyChannel) {
+            this(keyChannel, false);
+        }
 
         @Override
         public Operator get(DriverContext driverContext) {
-            return new BytesRefDistinctByOperator(keyChannel, ignoreDuplicate, driverContext.blockFactory());
+            return new DistinctByOperator(
+                keyChannel(),
+                new OrdinalIntegerProcessor(keyChannel(), OnDuplicateKeyPolicy.newPolicy(failOnDuplicate), driverContext.bigArrays())
+            );
         }
 
         @Override
         public String describe() {
-            return "DistinctByOperator[keyChannel=" + keyChannel + "]";
+            return "DistinctByOperator[keyChannel=" + keyChannel + ", type=ORDINAL]";
         }
     }
 
-    protected final int channel;
-    protected final boolean ignoreDuplicate;
+    private final int keyChannel;
+    private final Processor processor;
 
-    protected DistinctByOperator(int channel, boolean ignoreDuplicate) {
-        this.channel = channel;
-        this.ignoreDuplicate = ignoreDuplicate;
+    private DistinctByOperator(int keyChannel, Processor processor) {
+        this.keyChannel = keyChannel;
+        this.processor = processor;
     }
 
-    /**
-     * The exception thrown when a duplicate key is seen while {@code ignoreDuplicate == false}.
-     */
-    protected final IllegalArgumentException duplicateKey() {
-        return new IllegalArgumentException("found a duplicate key on channel [" + channel + "]");
+    @Override
+    protected Page process(Page page) {
+        return processor.process(page);
     }
 
-    /**
-     * {@link DistinctByOperator} keyed on an arbitrary {@link BytesRefBlock} column (e.g. {@code _tsid}),
-     * backed by a {@link BytesRefHashTable} seen-set. The hash table doubles as the seen-set: an
-     * {@code add} that returns a negative id means the key was already present.
-     */
-    public static class BytesRefDistinctByOperator extends DistinctByOperator {
+    @Override
+    public String toString() {
+        return "DistinctByOperator[keyChannel=" + keyChannel + ", " + processor + "]";
+    }
 
-        private final BytesRefHashTable seenKeys;
+    @Override
+    public void close() {
+        Releasables.close(processor, super::close);
+    }
 
-        public BytesRefDistinctByOperator(int channel, boolean ignoreDuplicate, BlockFactory blockFactory) {
-            super(channel, ignoreDuplicate);
-            this.seenKeys = HashImplFactory.newBytesRefHash(blockFactory);
+    private abstract static class Processor implements Releasable {
+        protected final int keyChannel;
+        protected final OnDuplicateKeyPolicy onDuplicateKeyPolicy;
+
+        private Processor(int keyChannel, OnDuplicateKeyPolicy onDuplicateKeyPolicy) {
+            this.keyChannel = keyChannel;
+            this.onDuplicateKeyPolicy = onDuplicateKeyPolicy;
+        }
+
+        /** Processes the key block and reports each position to {@link #onDuplicateKeyPolicy}. */
+        protected abstract void processKeys(Page page);
+
+        final Page process(Page page) {
+            onDuplicateKeyPolicy.beginPage(page.getPositionCount());
+            processKeys(page);
+            return onDuplicateKeyPolicy.finishPage(page);
         }
 
         @Override
-        protected Page process(Page page) {
-            // Release the input page only on success. On the duplicate-throw path we leave it for the
-            // operator's close() to release the still-pending page, avoiding a double release.
-            boolean success = false;
-            try {
-                Page result = doProcess(page);
-                success = true;
-                return result;
-            } finally {
-                if (success) {
-                    page.releaseBlocks();
-                }
+        public void close() {}
+    }
+
+    /** Policy mixed into a {@link Processor} to select or reject duplicate keys. */
+    private abstract static class OnDuplicateKeyPolicy {
+        private final boolean allValues;
+        private final String name;
+
+        static OnDuplicateKeyPolicy newPolicy(boolean failOnDuplicate) {
+            if (failOnDuplicate) {
+                return new FailOnDuplicateKeyPolicy();
+            }
+            return new SkipOnDuplicateKeyPolicy();
+        }
+
+        private OnDuplicateKeyPolicy(boolean allValues, String name) {
+            this.allValues = allValues;
+            this.name = name;
+        }
+
+        void beginPage(int positionCount) {}
+
+        final void constant(int positionCount, boolean duplicate) {
+            if (positionCount > 0) {
+                key(0, duplicate);
+            }
+            if (positionCount > 1) {
+                key(1, true);
             }
         }
 
-        private Page doProcess(Page page) {
-            BytesRefBlock keyBlock = page.getBlock(channel);
-            BytesRef scratch = new BytesRef();
+        /** Handles a non-null key at {@code position}. */
+        abstract void key(int position, boolean duplicate);
 
-            BytesRefVector vector = keyBlock.asVector();
-            if (vector != null && vector.isConstant()) {
-                BytesRef key = vector.getBytesRef(0, scratch);
-                long result = seenKeys.add(key);
-                if (result >= 0) {
-                    return page.filter(false, 0);
-                }
-                if (ignoreDuplicate == false) {
-                    throw duplicateKey();
-                }
-                return null;
+        void nullKey(int position) {}
+
+        Page finishPage(Page page) {
+            return page;
+        }
+    }
+
+    private static final class SkipOnDuplicateKeyPolicy extends OnDuplicateKeyPolicy {
+        private int[] selectedPositions = new int[0];
+        private int[] positions;
+        private int positionCount;
+        private int selectedCount;
+
+        private SkipOnDuplicateKeyPolicy() {
+            super(false, "Dedup");
+        }
+
+        @Override
+        void beginPage(int positionCount) {
+            this.positionCount = positionCount;
+            positions = null;
+            selectedCount = 0;
+        }
+
+        @Override
+        void key(int position, boolean duplicate) {
+            if (duplicate) {
+                reject(position);
+            } else if (positions != null) {
+                positions[selectedCount++] = position;
             }
+        }
 
-            if (vector != null) {
-                OrdinalBytesRefVector ordinals = vector.asOrdinals();
-                if (ordinals != null) {
-                    return processOrdinalsVector(page, ordinals);
-                }
+        @Override
+        void nullKey(int position) {
+            reject(position);
+        }
+
+        @Override
+        Page finishPage(Page page) {
+            Page result;
+            if (positions == null) {
+                result = page.shallowCopy();
+            } else if (selectedCount == 0) {
+                result = null;
             } else {
-                OrdinalBytesRefBlock ordinals = keyBlock.asOrdinals();
-                if (ordinals != null) {
-                    return processOrdinalsBlock(page, ordinals);
-                }
+                result = page.filter(false, positions, 0, selectedCount);
             }
-
-            int rowCount = 0;
-            int[] positions = new int[page.getPositionCount()];
-            for (int p = 0; p < page.getPositionCount(); p++) {
-                if (keyBlock.isNull(p)) {
-                    continue;
-                }
-                BytesRef key = keyBlock.getBytesRef(p, scratch);
-                long result = seenKeys.add(key);
-                if (result >= 0) {
-                    positions[rowCount++] = p;
-                } else if (ignoreDuplicate == false) {
-                    throw duplicateKey();
-                }
-            }
-            return filteredPage(page, positions, rowCount);
+            page.releaseBlocks();
+            return result;
         }
 
-        /**
-         * Fast path for ordinal vectors (no nulls): hash only the dictionary entries,
-         * then filter positions using cheap integer ordinal lookups.
-         */
-        private Page processOrdinalsVector(Page page, OrdinalBytesRefVector ordinals) {
-            boolean[] skipOrdinal = hashDictionary(ordinals.getDictionaryVector());
-            IntVector ords = ordinals.getOrdinalsVector();
-            int rowCount = 0;
-            int[] positions = new int[page.getPositionCount()];
-            for (int p = 0; p < ords.getPositionCount(); p++) {
-                int ord = ords.getInt(p);
-                if (skipOrdinal[ord] == false) {
-                    positions[rowCount++] = p;
-                    skipOrdinal[ord] = true;
-                } else if (ignoreDuplicate == false) {
-                    throw duplicateKey();
-                }
+        private void reject(int rejectedPosition) {
+            if (positions == null) {
+                positions = beginSelection(positionCount, rejectedPosition);
+                selectedCount = rejectedPosition;
             }
-            return filteredPage(page, positions, rowCount);
         }
 
-        /**
-         * Fast path for ordinal blocks (may contain nulls): hash only the dictionary entries,
-         * then filter positions using cheap integer ordinal lookups, skipping null positions.
-         */
-        private Page processOrdinalsBlock(Page page, OrdinalBytesRefBlock ordinals) {
-            boolean[] skipOrdinal = hashDictionary(ordinals.getDictionaryVector());
-            IntBlock ords = ordinals.getOrdinalsBlock();
-            int rowCount = 0;
-            int[] positions = new int[page.getPositionCount()];
-            for (int p = 0; p < ords.getPositionCount(); p++) {
-                if (ords.isNull(p)) {
-                    continue;
-                }
-                int ord = ords.getInt(ords.getFirstValueIndex(p));
-                if (skipOrdinal[ord] == false) {
-                    positions[rowCount++] = p;
-                    skipOrdinal[ord] = true;
-                } else if (ignoreDuplicate == false) {
-                    throw duplicateKey();
-                }
+        private int[] beginSelection(int positionCount, int rejectedPosition) {
+            if (selectedPositions.length < positionCount) {
+                selectedPositions = new int[positionCount];
             }
-            return filteredPage(page, positions, rowCount);
+            for (int p = 0; p < rejectedPosition; p++) {
+                selectedPositions[p] = p;
+            }
+            return selectedPositions;
         }
+    }
 
-        /**
-         * Adds all dictionary entries to {@link #seenKeys} and returns a boolean array
-         * indexed by ordinal: {@code true} means the key was already present (skip it).
-         */
-        private boolean[] hashDictionary(BytesRefVector dictionary) {
-            BytesRef scratch = new BytesRef();
-            boolean[] skip = new boolean[dictionary.getPositionCount()];
-            for (int d = 0; d < dictionary.getPositionCount(); d++) {
-                skip[d] = seenKeys.add(dictionary.getBytesRef(d, scratch)) < 0;
-            }
-            return skip;
-        }
-
-        private static Page filteredPage(Page page, int[] positions, int rowCount) {
-            if (rowCount == 0) {
-                return null;
-            }
-            if (rowCount == page.getPositionCount()) {
-                return page.shallowCopy();
-            }
-            return page.filter(false, positions, 0, rowCount);
+    private static final class FailOnDuplicateKeyPolicy extends OnDuplicateKeyPolicy {
+        private FailOnDuplicateKeyPolicy() {
+            super(true, "Guard");
         }
 
         @Override
-        public String toString() {
-            return "BytesRefDistinctByOperator[channel="
-                + channel
-                + ", ignoreDuplicate="
-                + ignoreDuplicate
-                + ", seenKeys="
-                + seenKeys.size()
-                + "]";
+        void key(int position, boolean duplicate) {
+            if (duplicate) {
+                throw new IllegalArgumentException("input channel cannot emit duplicate keys when [failOnDuplicate] is [true]");
+            }
+        }
+    }
+
+    private static final class BytesRefProcessor extends Processor {
+        private final BytesRefHashTable seenKeys;
+        private final BytesRef scratch = new BytesRef();
+        private byte[] pageOrdinalGenerations = new byte[0];
+        private byte pageGeneration;
+
+        private BytesRefProcessor(int keyChannel, OnDuplicateKeyPolicy onDuplicateKeyPolicy, BlockFactory blockFactory) {
+            super(keyChannel, onDuplicateKeyPolicy);
+            this.seenKeys = HashImplFactory.newBytesRefHash(blockFactory);
         }
 
         @Override
         public void close() {
             seenKeys.close();
-            super.close();
         }
-    }
 
-    /**
-     * {@link DistinctByOperator} keyed on a dense, non-negative integer ordinal column (e.g. a join
-     * ordinal), backed by a {@link BitArray} seen-set. The ordinal is already dense, so membership is
-     * a direct bit test - no hashing, no allocation - which is why this is preferred over feeding an
-     * int through the {@link BytesRefDistinctByOperator} hash table.
-     * <p>
-     *   With {@code ignoreDuplicate == false} the operator is a pass-through guard used to enforce 1:1
-     *   uniqueness: it throws on the second row that maps to an already-seen ordinal. With
-     *   {@code ignoreDuplicate == true} it keeps the first row per ordinal and drops the rest. Null
-     *   ordinals (e.g. join misses) are never duplicates.
-     * </p>
-     */
-    public static class OrdinalDistinctByOperator extends DistinctByOperator {
+        private byte beginOrdinalPage(int dictionarySize) {
+            byte generation = (byte) (pageGeneration + 1);
+            if (generation == 0) {
+                pageOrdinalGenerations = new byte[dictionarySize];
+                generation = 1;
+            } else if (pageOrdinalGenerations.length < dictionarySize) {
+                pageOrdinalGenerations = new byte[dictionarySize];
+            }
+            pageGeneration = generation;
+            return generation;
+        }
 
-        private final BitArray seen;
-
-        public OrdinalDistinctByOperator(int channel, boolean ignoreDuplicate, BigArrays bigArrays) {
-            super(channel, ignoreDuplicate);
-            this.seen = new BitArray(1, bigArrays);
+        /** Returns {@code true} only for the first occurrence of {@code ordinal} in the current page. */
+        private boolean markFirstPageOrdinal(int ordinal, byte generation) {
+            if (pageOrdinalGenerations[ordinal] == generation) {
+                return false;
+            }
+            pageOrdinalGenerations[ordinal] = generation;
+            return true;
         }
 
         @Override
-        protected Page process(Page page) {
-            IntBlock ordinals = page.getBlock(channel);
-            return ignoreDuplicate ? dedup(page, ordinals) : guard(page, ordinals);
-        }
-
-        /**
-         * Pass-through guard: mark every ordinal and throw on the first repeat. The page is returned
-         * unchanged, transferring ownership downstream; on the throw path we deliberately do NOT
-         * release it, leaving the still-pending page for the operator's close() to release.
-         */
-        private Page guard(Page page, IntBlock ordinals) {
-            IntVector vector = ordinals.asVector();
+        protected void processKeys(Page page) {
+            BytesRefBlock keyBlock = page.getBlock(keyChannel);
+            BytesRefVector vector = keyBlock.asVector();
             if (vector != null) {
-                for (int p = 0; p < vector.getPositionCount(); p++) {
-                    if (seen.getAndSet(vector.getInt(p))) {
-                        throw duplicateKey();
-                    }
+                if (vector.isConstant()) {
+                    processConstantVector(vector);
+                    return;
                 }
-            } else {
-                for (int p = 0; p < ordinals.getPositionCount(); p++) {
-                    if (ordinals.isNull(p)) {
-                        continue;
-                    }
-                    if (seen.getAndSet(ordinals.getInt(ordinals.getFirstValueIndex(p)))) {
-                        throw duplicateKey();
-                    }
+                OrdinalBytesRefVector ordinals = vector.asOrdinals();
+                if (ordinals == null) {
+                    processVector(vector);
+                } else {
+                    processOrdinalsVector(ordinals);
                 }
+                return;
             }
-            return page;
+
+            OrdinalBytesRefBlock ordinals = keyBlock.asOrdinals();
+            if (ordinals == null) {
+                if (onDuplicateKeyPolicy.allValues) {
+                    processAllValues(keyBlock);
+                } else {
+                    processFirstValue(keyBlock);
+                }
+            } else if (onDuplicateKeyPolicy.allValues) {
+                processAllOrdinalValues(ordinals);
+            } else {
+                processFirstOrdinalValue(ordinals);
+            }
         }
 
-        /**
-         * Keep the first row per ordinal, drop repeats and nulls. Builds a new page (which retains the
-         * blocks it keeps), then releases the input.
-         */
-        private Page dedup(Page page, IntBlock ordinals) {
-            int rowCount = 0;
-            int[] positions = new int[page.getPositionCount()];
-            for (int p = 0; p < page.getPositionCount(); p++) {
-                if (ordinals.isNull(p)) {
-                    continue;
-                }
-                if (seen.getAndSet(ordinals.getInt(ordinals.getFirstValueIndex(p))) == false) {
-                    positions[rowCount++] = p;
+        private void processConstantVector(BytesRefVector vector) {
+            onDuplicateKeyPolicy.constant(vector.getPositionCount(), seenKeys.add(vector.getBytesRef(0, scratch)) < 0);
+        }
+
+        private void processVector(BytesRefVector vector) {
+            int positionCount = vector.getPositionCount();
+            for (int p = 0; p < positionCount; p++) {
+                onDuplicateKeyPolicy.key(p, seenKeys.add(vector.getBytesRef(p, scratch)) < 0);
+            }
+        }
+
+        private void processFirstValue(BytesRefBlock block) {
+            int positionCount = block.getPositionCount();
+            for (int p = 0; p < positionCount; p++) {
+                if (block.isNull(p)) {
+                    onDuplicateKeyPolicy.nullKey(p);
+                } else {
+                    onDuplicateKeyPolicy.key(p, seenKeys.add(block.getBytesRef(block.getFirstValueIndex(p), scratch)) < 0);
                 }
             }
-            Page out;
-            if (rowCount == 0) {
-                out = null;
-            } else if (rowCount == page.getPositionCount()) {
-                out = page.shallowCopy();
-            } else {
-                out = page.filter(false, positions, 0, rowCount);
+        }
+
+        private void processAllValues(BytesRefBlock block) {
+            int positionCount = block.getPositionCount();
+            for (int p = 0; p < positionCount; p++) {
+                int first = block.getFirstValueIndex(p);
+                int end = first + block.getValueCount(p);
+                for (int valueIndex = first; valueIndex < end; valueIndex++) {
+                    onDuplicateKeyPolicy.key(p, seenKeys.add(block.getBytesRef(valueIndex, scratch)) < 0);
+                }
             }
-            page.releaseBlocks();
-            return out;
+        }
+
+        private void processOrdinalsVector(OrdinalBytesRefVector ordinals) {
+            IntVector ordinalVector = ordinals.getOrdinalsVector();
+            BytesRefVector dictionary = ordinals.getDictionaryVector();
+            byte generation = beginOrdinalPage(dictionary.getPositionCount());
+            int positionCount = ordinalVector.getPositionCount();
+
+            for (int p = 0; p < positionCount; p++) {
+                processOrdinal(p, dictionary, ordinalVector.getInt(p), generation);
+            }
+        }
+
+        private void processFirstOrdinalValue(OrdinalBytesRefBlock ordinals) {
+            IntBlock ordinalBlock = ordinals.getOrdinalsBlock();
+            BytesRefVector dictionary = ordinals.getDictionaryVector();
+            byte generation = beginOrdinalPage(dictionary.getPositionCount());
+            int positionCount = ordinalBlock.getPositionCount();
+
+            for (int p = 0; p < positionCount; p++) {
+                if (ordinalBlock.isNull(p)) {
+                    onDuplicateKeyPolicy.nullKey(p);
+                } else {
+                    processOrdinal(p, dictionary, ordinalBlock.getInt(ordinalBlock.getFirstValueIndex(p)), generation);
+                }
+            }
+        }
+
+        private void processAllOrdinalValues(OrdinalBytesRefBlock ordinals) {
+            IntBlock ordinalBlock = ordinals.getOrdinalsBlock();
+            BytesRefVector dictionary = ordinals.getDictionaryVector();
+            byte generation = beginOrdinalPage(dictionary.getPositionCount());
+            int positionCount = ordinalBlock.getPositionCount();
+
+            for (int p = 0; p < positionCount; p++) {
+                int first = ordinalBlock.getFirstValueIndex(p);
+                int end = first + ordinalBlock.getValueCount(p);
+                for (int valueIndex = first; valueIndex < end; valueIndex++) {
+                    processOrdinal(p, dictionary, ordinalBlock.getInt(valueIndex), generation);
+                }
+            }
+        }
+
+        private void processOrdinal(int position, BytesRefVector dictionary, int ordinal, byte generation) {
+            boolean duplicate = markFirstPageOrdinal(ordinal, generation) == false;
+            if (duplicate == false) {
+                duplicate = seenKeys.add(dictionary.getBytesRef(ordinal, scratch)) < 0;
+            }
+            onDuplicateKeyPolicy.key(position, duplicate);
         }
 
         @Override
         public String toString() {
-            return "OrdinalDistinctByOperator[channel=" + channel + ", ignoreDuplicate=" + ignoreDuplicate + "]";
+            return "BytesRef" + onDuplicateKeyPolicy.name + "Processor[seenKeys=" + seenKeys.size() + "]";
+        }
+    }
+
+    private static final class OrdinalIntegerProcessor extends Processor {
+        private final BitArray seen;
+
+        private OrdinalIntegerProcessor(int keyChannel, OnDuplicateKeyPolicy onDuplicateKeyPolicy, BigArrays bigArrays) {
+            super(keyChannel, onDuplicateKeyPolicy);
+            this.seen = new BitArray(1, bigArrays);
         }
 
         @Override
         public void close() {
-            Releasables.close(seen, super::close);
+            seen.close();
+        }
+
+        @Override
+        protected void processKeys(Page page) {
+            IntBlock ordinalBlock = page.getBlock(keyChannel);
+            IntVector vector = ordinalBlock.asVector();
+            if (vector == null) {
+                if (onDuplicateKeyPolicy.allValues) {
+                    processAllValues(ordinalBlock);
+                } else {
+                    processFirstValue(ordinalBlock);
+                }
+            } else if (vector.isConstant()) {
+                onDuplicateKeyPolicy.constant(vector.getPositionCount(), getAndSetOrdinal(vector.getInt(0)));
+            } else {
+                processVector(vector);
+            }
+        }
+
+        private void processVector(IntVector vector) {
+            int positionCount = vector.getPositionCount();
+            for (int p = 0; p < positionCount; p++) {
+                onDuplicateKeyPolicy.key(p, getAndSetOrdinal(vector.getInt(p)));
+            }
+        }
+
+        private void processFirstValue(IntBlock block) {
+            int positionCount = block.getPositionCount();
+            for (int p = 0; p < positionCount; p++) {
+                if (block.isNull(p)) {
+                    onDuplicateKeyPolicy.nullKey(p);
+                } else {
+                    onDuplicateKeyPolicy.key(p, getAndSetOrdinal(block.getInt(block.getFirstValueIndex(p))));
+                }
+            }
+        }
+
+        private void processAllValues(IntBlock block) {
+            int positionCount = block.getPositionCount();
+            for (int p = 0; p < positionCount; p++) {
+                int first = block.getFirstValueIndex(p);
+                int end = first + block.getValueCount(p);
+                for (int valueIndex = first; valueIndex < end; valueIndex++) {
+                    onDuplicateKeyPolicy.key(p, getAndSetOrdinal(block.getInt(valueIndex)));
+                }
+            }
+        }
+
+        private boolean getAndSetOrdinal(int ordinal) {
+            if (ordinal < 0) {
+                throw new IllegalArgumentException("ordinal key must be non-negative but was [" + ordinal + "]");
+            }
+            return seen.getAndSet(ordinal);
+        }
+
+        @Override
+        public String toString() {
+            return "Ordinal" + onDuplicateKeyPolicy.name + "Processor";
         }
     }
 }
